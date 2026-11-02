@@ -6,7 +6,7 @@
 namespace {
 GLuint createShaderProgram() {
     constexpr const char* vertexSource = R"(
-        #version 460 core
+        #version 450 core
         layout (location = 0) in vec2 position;
 
         void main() {
@@ -54,24 +54,24 @@ GLuint createShaderProgram() {
 }
 }
 
-bool Ground::collide(glm::vec2& position,
-                     glm::vec2 halfSize,
-                     glm::vec2& velocity) const {
-    const float bottom = position.y + halfSize.y;
-    const bool insideHorizontalRange =
-        position.x + halfSize.x > left &&
-        position.x - halfSize.x < right;
+Ground::Ground(b2WorldId world) : world_(world) {
+    b2BodyDef bodyDefinition = b2DefaultBodyDef();
+    bodyDefinition.position = {0.0f, -5.0f};
+    body_ = b2CreateBody(world_, &bodyDefinition);
 
-    if (!insideHorizontalRange || bottom < top || velocity.y < 0.0f) {
-        return false;
-    }
-
-    position.y = top - halfSize.y;
-    velocity.y = 0.0f;
-    return true;
+    b2ShapeDef shapeDefinition = b2DefaultShapeDef();
+    shapeDefinition.material.friction = 0.8f;
+    const b2Polygon box = b2MakeBox(20.0f, 1.0f);
+    b2CreatePolygonShape(body_, &shapeDefinition, &box);
 }
 
-void Ground::draw() {
+Ground::~Ground() {
+    if (B2_IS_NON_NULL(body_)) {
+        b2DestroyBody(body_);
+    }
+}
+
+void Ground::draw() const {
     static const GLuint program = createShaderProgram();
     static GLuint vao{};
     static GLuint vbo{};
@@ -92,6 +92,10 @@ void Ground::draw() {
         glEnableVertexAttribArray(0);
     }
 
+    constexpr float left = -1000.0f;
+    constexpr float right = 1000.0f;
+    constexpr float top = 200.0f;
+    constexpr float thickness = 100.0f;
     const float vertices[] = {
         left, top,
         right, top,

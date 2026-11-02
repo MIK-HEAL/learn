@@ -14,12 +14,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(GLEW CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
+find_package(box2d CONFIG REQUIRED)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 add_executable(window
     src/main.cpp
+    src/body.cpp
     src/ground.cpp/ground.cpp
     src/window/window.cpp
 )
@@ -28,6 +30,7 @@ target_link_libraries(window PRIVATE
     glfw
     GLEW::GLEW
     glm::glm
+    box2d::box2d
     opengl32
 )
 

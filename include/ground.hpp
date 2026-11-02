@@ -1,16 +1,16 @@
 #pragma once
 
+#include <box2d/box2d.h>
 #include <glm/vec2.hpp>
 
-struct Ground {
-    float left{-1000.0f};
-    float right{1000.0f};
-    float top{200.0f};
-    float thickness{100.0f};
+class Ground {
+public:
+    explicit Ground(b2WorldId world);
+    ~Ground();
 
-    bool collide(glm::vec2& position,
-                 glm::vec2 halfSize,
-                 glm::vec2& velocity) const;
+    void draw() const;
 
-    void draw();
+private:
+    b2WorldId world_{};
+    b2BodyId body_{};
 };

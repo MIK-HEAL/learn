@@ -4,6 +4,7 @@
   "dependencies": [
     "glfw3",
     "glew",
-    "glm"
+    "glm",
+    "box2d"
   ]
 }
