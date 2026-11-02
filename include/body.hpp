@@ -1,26 +1,20 @@
 #pragma once
 
-#include <box2d/box2d.h>
-#include <glm/vec2.hpp>
-#include <vector>
+/// 只负责把 Ragdoll 画出来的渲染器（OpenGL 资源由它在构造时创建）。
+class Ragdoll;
 
-class Body {
+class BodyRenderer {
 public:
-    explicit Body(b2WorldId world);
-    ~Body();
+    BodyRenderer();
+    ~BodyRenderer();
 
-    void draw() const;
+    BodyRenderer(const BodyRenderer&) = delete;
+    BodyRenderer& operator=(const BodyRenderer&) = delete;
+
+    void draw(const Ragdoll& ragdoll) const;
 
 private:
-    struct Part {
-        b2BodyId body{};
-        glm::vec2 halfSize{};
-    };
-
-    b2WorldId world_{};
-    std::vector<Part> parts_;
-    std::vector<b2JointId> joints_;
-
-    b2BodyId createPart(glm::vec2 position, glm::vec2 halfSize);
-    void connect(b2BodyId first, b2BodyId second, glm::vec2 anchor);
+    unsigned int program_{};
+    unsigned int vao_{};
+    unsigned int vbo_{};
 };

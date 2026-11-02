@@ -1,0 +1,18 @@
+{
+  "version": 4,
+  "configurations": [
+    {
+      "name": "MSVC x64 (vcpkg manifest)",
+      "includePath": [
+        "${workspaceFolder}/include",
+        "${workspaceFolder}/build/msvc/vcpkg_installed/x64-windows/include"
+      ],
+      "defines": [
+        "BOX2D_DLL"
+      ],
+      "cStandard": "c17",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "windows-msvc-x64"
+    }
+  ]
+}

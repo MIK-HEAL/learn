@@ -6,6 +6,5 @@
   "cmake.buildPreset": "msvc-debug",
   "cmake.environment": {
     "VCPKG_ROOT": "D:/vcpkg/vcpkg"
-  },
-  "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools"
+  }
 }
