@@ -75,6 +75,24 @@ public:
     const std::vector<Part>& parts() const { return parts_; }
     const std::vector<b2JointId>& joints() const { return joints_; }
 
+    /// 在部件的世界坐标点处沿 direction 施加冲量，让该部件速度变化约 speedChange
+    /// （direction 会被归一化；作用于该点还会带出旋转，效果更接近"被撞"）
+    void applyImpulse(int partIndex, glm::vec2 worldPoint, glm::vec2 direction,
+                      float speedChange);
+
+    /// 随机挑一个部件、随机方向施加冲量（训练鲁棒性 / 抗撞击）
+    void applyRandomPush(std::mt19937& rng, float speedChange);
+
+    /// 在部件质心施加持续力，需要**每个物理步调用一次**。
+    /// acceleration 是期望的加速度（m/s^2），内部按该部件质量换算成力。
+    void applyForce(int partIndex, glm::vec2 direction, float acceleration);
+
+    /// 鼠标拾取：返回包含该世界坐标点的部件索引，没命中返回 -1
+    int findPartAt(glm::vec2 worldPoint) const;
+
+    glm::vec2 partPosition(int partIndex) const;
+    float partMass(int partIndex) const;
+
 private:
     Part createPart(glm::vec2 position, glm::vec2 halfSize);
     b2JointId connect(b2BodyId first, b2BodyId second, glm::vec2 anchor);

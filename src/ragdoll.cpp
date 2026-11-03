@@ -1,5 +1,7 @@
 #include "ragdoll.hpp"
 
+#include <glm/geometric.hpp>
+
 #include <algorithm>
 #include <cmath>
 
@@ -138,6 +140,84 @@ void Ragdoll::setActions(const float* actions) {
         actions_[slot] = value;
         b2RevoluteJoint_SetMotorSpeed(actuatorJoints_[slot], value * kMotorSpeedScale);
     }
+}
+
+void Ragdoll::applyImpulse(int partIndex, glm::vec2 worldPoint, glm::vec2 direction,
+                           float speedChange) {
+    if (partIndex < 0 || partIndex >= static_cast<int>(parts_.size())) {
+        return;
+    }
+    const Part& part = parts_[static_cast<std::size_t>(partIndex)];
+    const float length = glm::length(direction);
+    if (length < 1e-4f) {
+        return;
+    }
+    const glm::vec2 unit = direction / length;
+    const float mass = b2Body_GetMass(part.body);
+    const b2Vec2 impulse{unit.x * speedChange * mass, unit.y * speedChange * mass};
+    b2Body_ApplyLinearImpulse(part.body, impulse, {worldPoint.x, worldPoint.y}, true);
+}
+
+void Ragdoll::applyRandomPush(std::mt19937& rng, float speedChange) {
+    std::uniform_int_distribution<int> pickPart(0, kPartCount - 1);
+    std::uniform_real_distribution<float> horizontal(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> vertical(-0.35f, 0.35f);
+
+    const Part& part = parts_[static_cast<std::size_t>(pickPart(rng))];
+    glm::vec2 direction{horizontal(rng), vertical(rng)};
+    const float length = glm::length(direction);
+    if (length < 1e-3f) {
+        direction = {1.0f, 0.0f};
+    } else {
+        direction /= length;
+    }
+
+    const float mass = b2Body_GetMass(part.body);
+    // 作用在质心：只改变速度，不额外制造旋转，扰动更"干净"
+    b2Body_ApplyLinearImpulseToCenter(
+        part.body, {direction.x * speedChange * mass, direction.y * speedChange * mass}, true);
+}
+
+void Ragdoll::applyForce(int partIndex, glm::vec2 direction, float acceleration) {
+    if (partIndex < 0 || partIndex >= static_cast<int>(parts_.size())) {
+        return;
+    }
+    const float length = glm::length(direction);
+    if (length < 1e-4f) {
+        return;
+    }
+    const Part& part = parts_[static_cast<std::size_t>(partIndex)];
+    const glm::vec2 unit = direction / length;
+    const float mass = b2Body_GetMass(part.body);
+    b2Body_ApplyForceToCenter(
+        part.body, {unit.x * acceleration * mass, unit.y * acceleration * mass}, true);
+}
+
+int Ragdoll::findPartAt(glm::vec2 worldPoint) const {
+    for (int index = 0; index < static_cast<int>(parts_.size()); ++index) {
+        const Part& part = parts_[static_cast<std::size_t>(index)];
+        const b2Vec2 local =
+            b2Body_GetLocalPoint(part.body, {worldPoint.x, worldPoint.y});
+        if (std::abs(local.x) <= part.halfSize.x && std::abs(local.y) <= part.halfSize.y) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+glm::vec2 Ragdoll::partPosition(int partIndex) const {
+    if (partIndex < 0 || partIndex >= static_cast<int>(parts_.size())) {
+        return {0.0f, 0.0f};
+    }
+    const b2Vec2 position = b2Body_GetPosition(parts_[static_cast<std::size_t>(partIndex)].body);
+    return {position.x, position.y};
+}
+
+float Ragdoll::partMass(int partIndex) const {
+    if (partIndex < 0 || partIndex >= static_cast<int>(parts_.size())) {
+        return 0.0f;
+    }
+    return b2Body_GetMass(parts_[static_cast<std::size_t>(partIndex)].body);
 }
 
 void Ragdoll::randomize(std::mt19937& rng, float linearScale, float angularScale) {

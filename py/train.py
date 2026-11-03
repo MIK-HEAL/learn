@@ -36,6 +36,7 @@ import torch.nn as nn
 
 ROOT = Path(__file__).resolve().parent.parent
 MAGIC = 0x504C4D31  # 'P','L','M','1'，必须与 src/policy.cpp 一致
+LOG_STD_TAG = 0x4C535444  # 'LSTD'：策略文件尾部的探索噪声参数标记
 
 # worker 进程内的缓存（进程池会复用进程，避免重复建 env / 网络）
 _WORKER_ENVS: dict[int, "VectorRagdollEnv"] = {}
@@ -228,6 +229,81 @@ def export_policy(net: ActorCritic, mean: np.ndarray, std: np.ndarray, path: Pat
             stream.write(struct.pack("<ii", linear.in_features, linear.out_features))
             stream.write(weight.tobytes())  # 行优先 [out, in]
             stream.write(bias.tobytes())
+        # 追加探索噪声参数，供 --resume 恢复训练后期的噪声水平。
+        # C++ 侧读完层参数就返回，尾部字节会被忽略，格式保持兼容。
+        stream.write(struct.pack("<i", LOG_STD_TAG))
+        stream.write(net.log_std.detach().cpu().numpy().astype(np.float32).tobytes())
+
+
+def load_policy_into(net: "ActorCritic", path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """把导出的 policy.bin 读回 actor 权重，用于 --resume 续训。
+
+    返回 (mean, std) 以便恢复观测归一化参数；value 网络信息不在文件里，
+    会重新训练（通常几十轮就能追上）。
+    """
+    with open(path, "rb") as stream:
+        header = stream.read(16)
+        if len(header) != 16:
+            raise ValueError(f"策略文件过短: {path}")
+        magic, obs_dim, act_dim, layer_count = struct.unpack("<iiii", header)
+        if magic != MAGIC:
+            raise ValueError(f"策略文件格式不匹配: {path}")
+
+        mean = np.frombuffer(stream.read(4 * obs_dim), dtype=np.float32).copy()
+        std = np.frombuffer(stream.read(4 * obs_dim), dtype=np.float32).copy()
+
+        linears = [module for module in net.actor if isinstance(module, nn.Linear)]
+        if len(linears) != layer_count:
+            raise ValueError("策略文件层数与网络结构不一致")
+        for linear in linears:
+            in_dim, out_dim = struct.unpack("<ii", stream.read(8))
+            if (in_dim, out_dim) != (linear.in_features, linear.out_features):
+                raise ValueError("策略文件层维度与网络不一致")
+            weight = np.frombuffer(stream.read(4 * in_dim * out_dim), dtype=np.float32).copy()
+            bias = np.frombuffer(stream.read(4 * out_dim), dtype=np.float32).copy()
+            with torch.no_grad():
+                linear.weight.copy_(torch.as_tensor(weight.reshape(out_dim, in_dim)))
+                linear.bias.copy_(torch.as_tensor(bias))
+
+        # 可选的尾部：探索噪声参数（老文件没有这一段）
+        log_std: np.ndarray | None = None
+        tag = stream.read(4)
+        if len(tag) == 4 and struct.unpack("<i", tag)[0] == LOG_STD_TAG:
+            raw = stream.read(4 * act_dim)
+            if len(raw) == 4 * act_dim:
+                log_std = np.frombuffer(raw, dtype=np.float32).copy()
+
+    return mean.astype(np.float64), std.astype(np.float64), log_std
+
+
+def evaluate_policy(env: "RagdollEnv", net: "ActorCritic", mean: np.ndarray,
+                    std: np.ndarray, episodes: int) -> tuple[float, float]:
+    """用确定性策略（tanh(mean)）跑若干回合，返回 (平均回报, 平均存活步数)。"""
+    device = next(net.parameters()).device
+    was_training = net.training
+    net.eval()
+
+    returns: list[float] = []
+    lengths: list[float] = []
+    observation = env.reset()
+    for _ in range(max(1, episodes)):
+        episode_return = 0.0
+        steps = 0
+        done = False
+        while not done:
+            obs_t = torch.as_tensor(_normalize(observation, mean, std), device=device).unsqueeze(0)
+            with torch.no_grad():
+                action = torch.tanh(net.actor(obs_t)).squeeze(0).cpu().numpy().astype(np.float32)
+            observation, reward, done = env.step(action)
+            episode_return += reward
+            steps += 1
+            if done:
+                observation = env.reset()
+        returns.append(episode_return)
+        lengths.append(float(steps))
+
+    net.train(was_training)
+    return float(np.mean(returns)), float(np.mean(lengths))
 
 
 # --------------------------------------------------------------------------- worker
@@ -344,6 +420,26 @@ def train(args: argparse.Namespace) -> None:
     max_episode_steps = probe.max_episode_steps
     probe.close()
 
+    if args.eval_only:
+        eval_path = Path(args.eval_only)
+        if not eval_path.is_absolute():
+            eval_path = ROOT / eval_path
+        eval_net = ActorCritic(obs_size, act_size, args.hidden).to(device)
+        try:
+            eval_mean, eval_std, _ = load_policy_into(eval_net, eval_path)
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"评估失败: {error}") from error
+        eval_env = RagdollEnv(library, seed=args.seed)
+        mean_return, mean_length = evaluate_policy(
+            eval_env, eval_net, eval_mean, eval_std, args.eval_episodes
+        )
+        eval_env.close()
+        print(
+            f"评估 {eval_path.name}: 平均回报 {mean_return:.2f}，"
+            f"平均存活 {mean_length:.1f} 步（{args.eval_episodes} 个回合，确定性策略）"
+        )
+        return
+
     workers = max(1, args.workers)
     parallel = workers * args.envs
     print(f"物理库: {library}")
@@ -356,6 +452,49 @@ def train(args: argparse.Namespace) -> None:
     norm = RunningNorm(obs_size)
     net = ActorCritic(obs_size, act_size, args.hidden).to(device)
     optimizer = torch.optim.Adam(net.parameters(), lr=args.lr, eps=1e-5)
+
+    resume_baseline: float | None = None
+    baseline_snapshot: tuple[dict, np.ndarray, np.ndarray] | None = None
+    warmup = args.warmup if args.warmup is not None else (3 if args.resume else 0)
+
+    if args.resume:
+        resume_path = Path(args.resume)
+        if not resume_path.is_absolute():
+            resume_path = ROOT / resume_path
+        try:
+            mean, std, log_std = load_policy_into(net, resume_path)
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"续训失败: {error}") from error
+        norm.mean = mean
+        norm.var = np.maximum(std, 1e-6) ** 2
+        # 给一个较大的伪计数，避免新采样的前几批把统计量冲掉
+        norm.count = 1e4
+        if log_std is not None:
+            with torch.no_grad():
+                net.log_std.copy_(torch.as_tensor(log_std, device=device))
+            print(f"续训: 已载入 {resume_path.name} 的 actor、归一化参数与探索噪声")
+        else:
+            # 旧格式文件没有探索噪声字段：训练后期噪声通常已经很小，
+            # 用 -1.5（std≈0.22）比默认 -0.8 更接近真实水平，避免一续训就被噪声打崩
+            with torch.no_grad():
+                net.log_std.fill_(-1.5)
+            print(f"续训: {resume_path.name} 是旧格式（无探索噪声字段），用 log_std=-1.5 兜底")
+
+        # 先评估一次基线：续训后如果表现还不如原策略，就不应该覆盖原文件
+        baseline_env = RagdollEnv(library, seed=args.seed + 991)
+        resume_baseline, baseline_length = evaluate_policy(
+            baseline_env, net, norm.mean, norm.std, args.eval_episodes
+        )
+        baseline_env.close()
+        baseline_snapshot = (
+            {key: value.detach().clone() for key, value in net.state_dict().items()},
+            norm.mean.copy(),
+            norm.std.copy(),
+        )
+        print(
+            f"续训基线: 平均回报 {resume_baseline:.2f} / 平均存活 {baseline_length:.1f} 步"
+            f"（达不到这个水平不会覆盖 {Path(args.out).name}）"
+        )
 
     out_path = Path(args.out)
     if not out_path.is_absolute():
@@ -389,7 +528,7 @@ def train(args: argparse.Namespace) -> None:
     iteration = 0
     recent_returns: list[float] = []
     recent_lengths: list[float] = []
-    best_return = -float("inf")
+    best_return = resume_baseline if resume_baseline is not None else -float("inf")
     # 存一份历史最佳快照，避免最后一轮退化把好策略覆盖掉
     best_snapshot: tuple[dict, np.ndarray, np.ndarray] | None = None
     horizon = args.rollout
@@ -489,7 +628,12 @@ def train(args: argparse.Namespace) -> None:
                     value_loss = (net.value(obs_tensor[index]) - return_tensor[index]).pow(2).mean()
                     entropy = dist.entropy().sum(dim=-1).mean()
 
-                    loss = policy_loss + 0.5 * value_loss - args.entropy * entropy
+                    if iteration <= warmup:
+                        # 续训前几轮只让 critic 追上真实回报，
+                        # 否则新初始化的 critic 会给出错误的 advantage，把好策略更新坏
+                        loss = 0.5 * value_loss
+                    else:
+                        loss = policy_loss + 0.5 * value_loss - args.entropy * entropy
                     optimizer.zero_grad()
                     loss.backward()
                     nn.utils.clip_grad_norm_(net.parameters(), 0.5)
@@ -497,8 +641,9 @@ def train(args: argparse.Namespace) -> None:
 
             mean_return = float(np.mean(recent_returns[-20:])) if recent_returns else 0.0
             mean_length = float(np.mean(recent_lengths[-20:])) if recent_lengths else 0.0
+            progress = min(total_steps / max(args.steps, 1), 1.0)
             print(
-                f"[{iteration:4d}] 步数 {total_steps:8d} | 平均回报 {mean_return:8.2f} "
+                f"[{iteration:4d}] 步数 {total_steps:8d} ({progress:5.1%}) | 平均回报 {mean_return:8.2f} "
                 f"| 平均存活 {mean_length:6.1f} 步 | 策略损失 {float(policy_loss.detach()):7.3f} "
                 f"| 价值损失 {float(value_loss.detach()):8.3f} | batch {batch_size}"
             )
@@ -532,6 +677,11 @@ def train(args: argparse.Namespace) -> None:
         net.load_state_dict(best_snapshot[0])
         export_policy(net, best_snapshot[1], best_snapshot[2], out_path)
         print(f"已导出历史最佳策略（平均回报 {best_return:.2f}）")
+    elif baseline_snapshot is not None:
+        # 续训没超过原策略：保留原权重，别用更差的结果覆盖它
+        net.load_state_dict(baseline_snapshot[0])
+        export_policy(net, baseline_snapshot[1], baseline_snapshot[2], out_path)
+        print(f"本次未超过续训基线（{resume_baseline:.2f}），保留原策略权重")
     else:
         export_policy(net, norm.mean, norm.std, out_path)
     print(f"策略已导出: {out_path}")
@@ -540,7 +690,8 @@ def train(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="PPO 训练布娃娃站立")
-    parser.add_argument("--steps", type=int, default=1_000_000, help="总交互步数（所有角色加起来）")
+    parser.add_argument("--steps", type=int, default=3_000_000,
+                        help="总交互步数（所有角色加起来）；12 个角色并行时 300 万步约 20~40 分钟")
     parser.add_argument("--workers", type=int, default=1, help="并行进程数，建议设为 CPU 物理核数")
     parser.add_argument("--envs", type=int, default=8, help="每个进程内的角色数量")
     parser.add_argument("--rollout", type=int, default=512, help="每个角色每轮采样步数")
@@ -557,6 +708,14 @@ def main() -> None:
         "--device", type=str, default="auto", choices=["auto", "cpu", "cuda"],
         help="网络计算设备；auto 表示有 CUDA 就用 CUDA（需要装 CUDA 版 torch）",
     )
+    parser.add_argument("--resume", type=str, default=None,
+                        help="从已有的 policy.bin 继续训练（恢复 actor、归一化参数与探索噪声）")
+    parser.add_argument("--warmup", type=int, default=None,
+                        help="续训时前 N 轮只训练 critic（默认续训为 3，普通训练为 0）")
+    parser.add_argument("--eval-only", type=str, default=None,
+                        help="只评估指定的 policy.bin（确定性策略），不训练")
+    parser.add_argument("--eval-episodes", type=int, default=5,
+                        help="评估与续训基线使用的回合数")
     parser.add_argument("--lib", type=str, default=None, help="手动指定 rl_env 动态库路径")
     parser.add_argument("--out", type=str, default="py/policy.bin", help="策略导出路径")
     parser.add_argument("--log", type=str, default="py/runs/metrics.csv",

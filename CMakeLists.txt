@@ -48,6 +48,7 @@ endif()
 add_executable(window
     src/main.cpp
     src/body.cpp
+    src/console.cpp
     src/ragdoll.cpp
     src/policy.cpp
     src/ground.cpp/ground.cpp

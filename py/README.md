@@ -49,6 +49,37 @@ Python 与 C++ 之间的桥接没有用 pybind11，而是**纯 C ABI + ctypes**�
 
 另外整体乘 `kRewardScale = 0.25`，价值网络的回归目标从 ~1000 降到 ~250，critic 更容易学。
 
+### 抗撞击训练（对应演示里的鼠标撞击）
+
+训练环境会**每隔 1.5~4 秒随机挑一个部件、随机方向施加一次冲量**（速度变化 0.8~3.0 m/s，
+见 [`env_api.cpp`](../src/env_api.cpp:15)）。因此学到的是「被撞了还能站住」，
+而不是温室里的静态平衡——否则演示里鼠标一推就倒。
+
+演示时鼠标就是外力：
+
+* **左键点击角色任意部位** → 在该点施加一次冲量（4 m/s 速度变化），
+  方向朝身体内部，且因为作用点偏离质心会带出旋转，很像真被撞一下；
+* **按住左键**会每 0.1 秒重复施加，等于持续推，可以把角色推倒；
+* 命中时终端会打印 `撞击部件 #3 质量 0.47 kg`，可以据此确认鼠标坐标拾取是否正常。
+
+> 为什么加载训练好的策略后「点了好像没反应」？因为策略已经学会抗撞：
+> 一次冲量几百毫秒内就被拉回来，视觉上只剩微颤。想确认它真被撞了，
+> 打开终端看有没有打印命中信息，或者按住左键持续推。
+
+Python 侧也可以直接施加同样的冲量做抗撞评估：
+
+```python
+lib.env_poke(handle, part_index, direction_x, direction_y, speed_change)
+```
+
+调难度改这几个常量：
+
+| 想改什么 | 改哪里 |
+| --- | --- |
+| 撞击频率 | [`env_api.cpp`](../src/env_api.cpp:18) 的 `kPushIntervalMinSteps` / `kPushIntervalMaxSteps` |
+| 训练撞击强度 | [`env_api.cpp`](../src/env_api.cpp:20) 的 `kPushSpeedMin` / `kPushSpeedMax` |
+| 演示撞击强度 | [`main.cpp`](../src/main.cpp:30) 的 `kClickSpeedChange` |
+
 ## 2.1 关于 GPU 与并行加速（重要）
 
 必须澄清一个事实：**Box2D 物理只能在 CPU 上串行步进，搬不到 GPU**。
@@ -95,9 +126,11 @@ cmake --workflow --preset release
 python py/smoke_test.py
 
 # 4) 训练：8 进程 × 4 角色 = 32 个角色并行，网络更新走 GPU
+#    默认 300 万步；中断后可以接着上次的权重继续训
 python py/train.py --workers 8 --envs 4 --device cuda
+python py/train.py --workers 8 --envs 4 --device cuda --resume py/policy.bin --steps 2000000
 
-# 5) 回放：加载训练好的策略，看角色站起来
+# 5) 回放：加载训练好的策略，看角色站起来（用鼠标左键点角色可以撞它）
 build/msvc/bin/Release/window.exe py/policy.bin
 
 # 6) 不加载策略，只看物理自然倒下的原始行为
@@ -134,6 +167,44 @@ build\msvc\bin\Release\window.exe --watch py/policy.bin
 判断学没学会，看两个数：
 * **平均回报**：站直时每步约 0.875 分，站稳 400 步约 350 分（半跪只有约 0.4 分/步且很快终止）；
 * **平均存活步数**：上限 400（`kMaxEpisodeSteps`）。
+
+### 训练要跑多久
+
+这个任务是「保持平衡 + 抗随机撞击」，**几十万步远远不够**，参考量级：
+
+| 步数 | 大致水平 |
+| --- | --- |
+| 6 万 | 存活 100~200 步，刚学会不倒太快（就是 `--steps 60000` 的水平） |
+| 100 万 | 存活 250~350 步，能站住但被撞仍会倒 |
+| 300 万 | 基本能站满 400 步并抗住偶发撞击 |
+
+比「站得住」更重要的判据是**平均回报不再大幅波动**。中断了不用重来，用 `--resume`
+接着训即可（只恢复 actor 与归一化参数，critic 会快速重学）：
+
+```powershell
+python py/train.py --device cuda --workers 4 --envs 4 --resume py/policy.bin --steps 2000000
+```
+
+### 评估策略 & 续训的三项保护
+
+```powershell
+# 只评估（确定性策略，跑 10 个回合，不训练）
+python py/train.py --device cuda --eval-only py/policy.bin --eval-episodes 10
+
+# 续训
+python py/train.py --device cuda --workers 4 --envs 4 --resume py/policy.bin --steps 2000000
+```
+
+续训踩过的三个坑都已处理：
+
+| 坑 | 处理 |
+| --- | --- |
+| 探索噪声被重置，动作突然抖到站不住 | `log_std` 写进 `policy.bin` 尾部（C++ 读完层参数即返回，多余字节忽略），续训自动恢复；旧格式文件兜底用 `log_std=-1.5` |
+| critic 从零开始，错误的 advantage 会把好策略更新坏 | `--warmup`（续训默认 3）轮内**只训练 critic**，不更新策略 |
+| "最佳"基线清零，导致更差的策略覆盖原文件 | 启动时先用确定性策略**评估原策略**得到基线，整轮都没超过就保留原权重 |
+
+另外一个容易误判的点：**训练日志里的平均存活是带噪声采样的数值，通常明显低于确定性评估值**
+（实测日志 185 步、`--eval-only` 262 步）。判断真实水平请用 `--eval-only`。
 
 ## 4. 常用调参
 

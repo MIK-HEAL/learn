@@ -1,8 +1,8 @@
 #include "window.hpp"
+#include "console.hpp"
 
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
-#include <iostream>
 
 void framebuffer_size_callback(GLFWwindow* window, int windowWidth, int windowHeight){
     (void)window;
@@ -61,7 +61,7 @@ void Window::setupWindow() {
 
     window = glfwCreateWindow(800, 600, "Hachimi", nullptr, nullptr);
     if (!window) {
-        std::cerr << "Failed to create 4.6 context, trying 4.5..." << std::endl;
+        console::eprint("Failed to create 4.6 context, trying 4.5...\n");
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 5);
         window = glfwCreateWindow(800, 600, "Hachimi", nullptr, nullptr);
     }
@@ -75,7 +75,7 @@ void Window::setupWindow() {
 
     glewExperimental = GL_TRUE;
     if (glewInit() != GLEW_OK) {
-        std::cerr << "Failed to initialize GLEW" << std::endl;
+        console::eprint("Failed to initialize GLEW\n");
         glfwDestroyWindow(window);
         window = nullptr;
         glfwTerminate();

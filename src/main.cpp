@@ -1,4 +1,5 @@
 #include "window.hpp"
+#include "console.hpp"
 #include "ground.hpp"
 #include "body.hpp"
 #include "ragdoll.hpp"
@@ -7,6 +8,8 @@
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #include <box2d/box2d.h>
+
+#include <glm/vec2.hpp>
 
 #include <algorithm>
 #include <cstdio>
@@ -21,9 +24,21 @@ constexpr int kSubStepCount = 4;
 constexpr float kPolicyPollInterval = 0.5f; // 热重载轮询间隔（秒）
 constexpr float kRespawnDelay = 1.5f;       // 摔倒后多久自动复位（秒）
 
+// 顶点着色器把世界坐标映射为 px/400、-py/300 的 NDC（px = world * 50），
+// 因此 NDC = ±1 对应世界坐标 ±8 米 / ±6 米，用于把鼠标位置还原成世界坐标。
+constexpr float kWorldHalfWidth = 8.0f;
+constexpr float kWorldHalfHeight = 6.0f;
+// 单次冲量让被点部件产生的速度变化（m/s）。
+// 取 4.0 是因为冲量按"被点部件的质量"换算：点躯干时整体约 1.6 m/s（明显晃动），
+// 点手臂/小腿时该肢体会被甩开——1.5 太小，点轻部件几乎看不出反应。
+// 按住左键会按 kClickRepeatInterval 连续施加，所以「点一下」和「按住猛推」都能做到。
+constexpr float kClickSpeedChange = 4.0f;
+constexpr float kClickRepeatInterval = 0.1f;
+
 int runSelftest(const char* path) {
     Policy policy;
     if (!policy.load(path)) {
+        console::eprint("策略加载失败: %s\n", path);
         return 1;
     }
     std::vector<float> observation(
@@ -31,9 +46,10 @@ int runSelftest(const char* path) {
     std::vector<float> actions(
         static_cast<std::size_t>(policy.actionCount()), 0.0f);
     policy.forward(observation.data(), actions.data());
-    std::printf("obs=%d act=%d\n", policy.observationCount(), policy.actionCount());
+    console::print("策略校验通过: %s\n", path);
+    console::print("obs=%d act=%d\n", policy.observationCount(), policy.actionCount());
     for (int index = 0; index < policy.actionCount(); ++index) {
-        std::printf("%.6f\n", actions[static_cast<std::size_t>(index)]);
+        console::print("%.6f\n", actions[static_cast<std::size_t>(index)]);
     }
     return 0;
 }
@@ -48,7 +64,7 @@ int runViewer(const std::string& policyPath, bool watch) {
     if (!policyPath.empty()) {
         policyLoaded = policy.load(policyPath);
         if (!policyLoaded) {
-            std::fprintf(stderr, "策略加载失败: %s\n", policyPath.c_str());
+            console::eprint("策略加载失败: %s\n", policyPath.c_str());
         } else {
             std::error_code error;
             policyStamp = std::filesystem::last_write_time(policyPath, error);
@@ -56,9 +72,10 @@ int runViewer(const std::string& policyPath, bool watch) {
     }
     const bool showPolicy = !policyPath.empty();
     if (showPolicy) {
-        std::printf("正在回放策略: %s%s\n", policyPath.c_str(),
-                    watch ? "（监视文件更新，摔倒后自动复位）" : "");
+        console::print("正在回放策略: %s%s\n", policyPath.c_str(),
+                       watch ? "（监视文件更新，摔倒后自动复位）" : "");
     }
+    console::print("操作提示: 鼠标左键点击角色的任意部位即可施加一次撞击\n");
 
     b2WorldDef worldDefinition = b2DefaultWorldDef();
     worldDefinition.gravity = {0.0f, -9.8f};
@@ -74,6 +91,8 @@ int runViewer(const std::string& policyPath, bool watch) {
         float accumulator = 0.0f;
         float pollTimer = 0.0f;
         float fallenTimer = 0.0f;
+        float clickCooldown = 0.0f;
+        float hitMessageCooldown = 0.0f;
         double previousTime = glfwGetTime();
 
         while (!window.shouldClose())
@@ -96,12 +115,56 @@ int runViewer(const std::string& policyPath, bool watch) {
                     if (policy.load(policyPath)) {
                         policyStamp = stamp;
                         policyLoaded = true;
-                        std::printf("已重载策略: %s\n", policyPath.c_str());
+                        console::print("已重载策略: %s\n", policyPath.c_str());
                     }
                 }
             }
 
             window.processInput();
+
+            // 鼠标撞击：按住左键时对点中的部件持续施加冲量（点一下 = 推一下）
+            clickCooldown = std::max(0.0f, clickCooldown - frameDelta);
+            hitMessageCooldown = std::max(0.0f, hitMessageCooldown - frameDelta);
+            if (GLFWwindow* handle = window.nativeHandle()) {
+                const bool pressing =
+                    glfwGetMouseButton(handle, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+                if (pressing && clickCooldown <= 0.0f) {
+                    clickCooldown = kClickRepeatInterval;
+
+                    double cursorX = 0.0;
+                    double cursorY = 0.0;
+                    glfwGetCursorPos(handle, &cursorX, &cursorY);
+                    int windowWidth = 0;
+                    int windowHeight = 0;
+                    glfwGetWindowSize(handle, &windowWidth, &windowHeight);
+                    if (windowWidth > 0 && windowHeight > 0) {
+                        const glm::vec2 worldPoint{
+                            (2.0f * static_cast<float>(cursorX) /
+                                 static_cast<float>(windowWidth) -
+                             1.0f) *
+                                kWorldHalfWidth,
+                            (1.0f - 2.0f * static_cast<float>(cursorY) /
+                                        static_cast<float>(windowHeight)) *
+                                kWorldHalfHeight,
+                        };
+                        const int partIndex = ragdoll->findPartAt(worldPoint);
+                        if (partIndex >= 0) {
+                            const glm::vec2 target = ragdoll->partPosition(partIndex);
+                            // 朝身体内部推：方向 = 点击点 -> 部件质心
+                            ragdoll->applyImpulse(
+                                partIndex, worldPoint,
+                                {target.x - worldPoint.x, target.y - worldPoint.y},
+                                kClickSpeedChange);
+                            if (hitMessageCooldown <= 0.0f) {
+                                hitMessageCooldown = 0.5f;
+                                console::print("撞击部件 #%d 质量 %.2f kg\n", partIndex,
+                                               ragdoll->partMass(partIndex));
+                            }
+                        }
+                    }
+                }
+            }
+
             while (accumulator >= kTimeStep)
             {
                 if (policy.valid()) {
@@ -147,6 +210,9 @@ int runViewer(const std::string& policyPath, bool watch) {
 ///   window --selftest py/policy.bin     不建窗口，只验证策略文件
 int main(int argc, char** argv)
 {
+    // 控制台默认是 GBK 代码页，先把 stdout/stderr 调成能正确显示中文的模式
+    console::init();
+
     std::string policyPath;
     bool watch = false;
     for (int index = 1; index < argc; ++index) {
