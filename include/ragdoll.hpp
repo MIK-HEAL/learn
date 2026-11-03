@@ -40,8 +40,11 @@ public:
     /// 关节电机最大力矩（N*m）
     static constexpr float kMotorTorque = 160.0f;
 
-    /// 摔倒判定阈值
-    static constexpr float kFallHeight = -2.4f;
+    /// 站立时躯干中心的世界坐标高度（= 2.6 + kSpawnOffset），用于奖励塑形
+    static constexpr float kStandHeight = -0.1f;
+
+    /// 摔倒判定阈值：躯干比站姿低 1.2 米就算失败（跪姿约低 1.5 米以上）
+    static constexpr float kFallHeight = kStandHeight - 1.2f;
     static constexpr float kFallUpY = 0.35f;
 
     explicit Ragdoll(b2WorldId world, float verticalOffset = kSpawnOffset);
@@ -80,4 +83,7 @@ private:
     std::vector<Part> parts_;
     std::vector<b2JointId> joints_;
     std::array<b2JointId, kActuatorCount> actuatorJoints_{};
+    /// 当前 / 上一步动作，用于惩罚动作突变（抖动）
+    std::array<float, kActuatorCount> actions_{};
+    std::array<float, kActuatorCount> previousActions_{};
 };

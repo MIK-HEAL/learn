@@ -25,12 +25,8 @@ bool readFloats(std::ifstream& stream, std::vector<float>& values, int count) {
 } // namespace
 
 bool Policy::load(const std::string& path) {
-    layers_.clear();
-    mean_.clear();
-    inverseStd_.clear();
-    bufferA_.clear();
-    bufferB_.clear();
-
+    // 事务式加载：只有完整读完才替换内部状态，
+    // 这样热重载时遇到「文件正被写入」可以安全地保留旧策略。
     std::ifstream stream(path, std::ios::binary);
     if (!stream) {
         std::cerr << "无法打开策略文件: " << path << '\n';
@@ -90,11 +86,14 @@ bool Policy::load(const std::string& path) {
         inverseStd_[index] = 1.0f / std::max(stddev[index], 1e-6f);
     }
     layers_ = std::move(layers);
-    bufferA_.assign(static_cast<std::size_t>(observationCount), 0.0f);
-    bufferB_.assign(static_cast<std::size_t>(layers_.front().out), 0.0f);
+    // 两个缓冲区都按「最大层维度」分配：forward 每算完一层就交换两者，
+    // 否则首层输出维度大于输入维度时会写出界。
+    std::size_t bufferSize = static_cast<std::size_t>(observationCount);
     for (const Layer& layer : layers_) {
-        bufferB_.resize(std::max(bufferB_.size(), static_cast<std::size_t>(layer.out)));
+        bufferSize = std::max(bufferSize, static_cast<std::size_t>(layer.out));
     }
+    bufferA_.assign(bufferSize, 0.0f);
+    bufferB_.assign(bufferSize, 0.0f);
     return true;
 }
 

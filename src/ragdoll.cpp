@@ -20,8 +20,17 @@ struct JointSpec {
     float upper{};
 };
 
-constexpr float kJointLimit = 2.4f;
+// 收紧限位：原先 ±2.4 rad 允许膝盖反折，跪姿反而成了稳定解
+constexpr float kJointLimit = 1.8f;
 constexpr float kNeckLimit = 0.5f;
+
+// 用于「腿部伸展度」的关节索引：左髋、左膝、右髋、右膝
+constexpr int kLegJointIndices[] = {5, 6, 7, 8};
+constexpr int kLegJointCount =
+    static_cast<int>(sizeof(kLegJointIndices) / sizeof(kLegJointIndices[0]));
+
+// 奖励整体缩放，让价值网络的回归目标落在更友好的量级
+constexpr float kRewardScale = 0.25f;
 
 // 与原先 Body 中的布局完全一致，只是把数据抽成表，方便训练环境复用。
 const PartSpec kPartSpecs[Ragdoll::kPartCount] = {
@@ -122,10 +131,12 @@ void Ragdoll::setActions(const float* actions) {
     if (actions == nullptr) {
         return;
     }
+    previousActions_ = actions_;
     for (int index = 0; index < kActuatorCount; ++index) {
+        const auto slot = static_cast<std::size_t>(index);
         const float value = std::clamp(actions[index], -1.0f, 1.0f);
-        b2RevoluteJoint_SetMotorSpeed(
-            actuatorJoints_[static_cast<std::size_t>(index)], value * kMotorSpeedScale);
+        actions_[slot] = value;
+        b2RevoluteJoint_SetMotorSpeed(actuatorJoints_[slot], value * kMotorSpeedScale);
     }
 }
 
@@ -175,22 +186,46 @@ void Ragdoll::getObservation(float* observation) const {
 }
 
 float Ragdoll::reward(const float* actions) const {
+    (void)actions; // 统一使用 setActions 里 clamp 后的动作，与电机输入严格一致
+
     const b2Vec2 position = b2Body_GetPosition(parts_[0].body);
     const float upright = baseUprightness();
-    // 躯干高度归一化到 [-1, 1]，站立时约为 1
-    const float height =
-        std::clamp((position.y - (kGroundTopY + 1.0f)) / 2.0f, -1.0f, 1.0f);
 
-    float control = 0.0f;
-    if (actions != nullptr) {
-        for (int index = 0; index < kActuatorCount; ++index) {
-            control += actions[index] * actions[index];
-        }
-        control /= static_cast<float>(kActuatorCount);
+    // 高度塑形：站直 -> 1，比站姿低 1.1 米 -> -1
+    // （原先用绝对高度且权重只有 0.5，跪姿几乎不掉分，于是成了局部最优）
+    const float height =
+        std::clamp(1.0f - (kStandHeight - position.y) / 1.1f, -1.0f, 1.0f);
+
+    // 腿部伸展度：跪/蹲会把髋、膝关节弯到接近限位，站立时接近 0
+    // 这一项直接针对「跪着不动」的退化解
+    float extension = 0.0f;
+    for (int index = 0; index < kLegJointCount; ++index) {
+        const auto slot = static_cast<std::size_t>(kLegJointIndices[index]);
+        const float angle = b2RevoluteJoint_GetAngle(joints_[slot]);
+        extension += 1.0f - std::min(std::abs(angle) / kJointLimit, 1.0f);
     }
+    extension /= static_cast<float>(kLegJointCount);
+
+    float energy = 0.0f;
+    float rate = 0.0f;
+    for (int index = 0; index < kActuatorCount; ++index) {
+        const auto slot = static_cast<std::size_t>(index);
+        energy += actions_[slot] * actions_[slot];
+        const float change = actions_[slot] - previousActions_[slot];
+        rate += change * change;
+    }
+    energy /= static_cast<float>(kActuatorCount);
+    rate /= static_cast<float>(kActuatorCount);
 
     const float drift = std::abs(position.x);
-    return 1.0f + 1.0f * upright + 0.5f * height - 0.03f * control - 0.02f * drift;
+    return kRewardScale *
+           (1.0f            // 存活
+            + upright       // 躯干朝上
+            + height        // 躯干高度接近站姿
+            + 0.5f * extension // 双腿接近伸直
+            - 0.05f * energy   // 动作能量
+            - 0.02f * rate     // 动作突变（防抖）
+            - 0.05f * drift);  // 横向漂移
 }
 
 bool Ragdoll::fallen() const {
